@@ -1,3 +1,3 @@
 ﻿  SIMCom FTP Tool.cpp
-C:\Users\yanan.sun\Desktop\SIMCom FTP Tool\SIMCom FTP Tool\SIMCom FTP Tool.cpp(526,10): warning C4101: “input”: 未引用的局部变量
-  SIMCom FTP Tool.vcxproj -> C:\Users\yanan.sun\Desktop\SIMCom FTP Tool\SIMCom FTP Tool\x64\Debug\SIMCom FTP Tool.exe
+C:\Users\yanan.sun\Desktop\SIMCom\SIMCom_EAT\SIMCom FTP Tool\SIMCom FTP Tool.cpp(539,10): warning C4101: “input”: 未引用的局部变量
+  SIMCom FTP Tool.vcxproj -> C:\Users\yanan.sun\Desktop\SIMCom\SIMCom_EAT\SIMCom FTP Tool\x64\Debug\SIMCom FTP Tool.exe

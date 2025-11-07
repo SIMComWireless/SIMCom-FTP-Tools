@@ -500,6 +500,19 @@ int download_file_data(HANDLE hCom, RingBuffer* rb, const char* filename, int to
                 expecting_data = 0;
                 break;
             }
+            else if (strstr(line, "+CFTPSGET: 3") != NULL) {
+                // Server returned code 3 for this offset — retry this offset
+                printf("Server returned +CFTPSGET: 3 for offset %d — will retry (attempt %d/%d)\n", offset, retries + 1, MAX_OFFSET_RETRIES);
+                retries++;
+                if (retries >= MAX_OFFSET_RETRIES) {
+                    printf("Exceeded max retries (%d) for offset %d, aborting.\n", MAX_OFFSET_RETRIES, offset);
+                    fclose(file);
+                    return 0;
+                }
+                // Stop waiting for DATA for this attempt; outer loop will re-send same offset
+                expecting_data = 0;
+                break;
+            }
             else if (strstr(line, "+CFTPSGET: 0") != NULL) {
                 expecting_data = 0;
                 offset += data_received;
@@ -532,6 +545,7 @@ int main(int argc, char** argv) {
     char ftp_user[128] = { 0 };
     char ftp_pass[128] = { 0 };
     char ftp_filename[260] = { 0 };
+    int baudRate = 115200; // default baud rate
 
     if (argc >= 7) {
         // argv[1] = COM (e.g., COM3)
@@ -542,6 +556,11 @@ int main(int argc, char** argv) {
         snprintf(ftp_user, sizeof(ftp_user), "%s", argv[4]);
         snprintf(ftp_pass, sizeof(ftp_pass), "%s", argv[5]);
         snprintf(ftp_filename, sizeof(ftp_filename), "%s", argv[6]);
+        // Optional 8th argument: baud rate
+        if (argc >= 8) {
+            int b = atoi(argv[7]);
+            if (b > 0) baudRate = b;
+        }
     }
     else {
         // interactive input (existing behavior)
@@ -551,6 +570,7 @@ int main(int argc, char** argv) {
         printf("\nEnter COM port to use (e.g., COM3): ");
         fgets(portName, sizeof(portName), stdin);
         portName[strcspn(portName, "\r\n")] = 0;
+
 
         printf("Enter FTP server address (e.g., 117.131.85.140): ");
         fgets(ftp_server, sizeof(ftp_server), stdin);
@@ -572,21 +592,12 @@ int main(int argc, char** argv) {
 
     printf("=== SIMCOM FTP File Download Tool ===\n\n");
 
-    // Enumerate serial ports
-    enumerate_serial_ports();
-
-    // Select COM port
-    printf("\nEnter COM port to use (e.g., COM3): ");
-    // If a COM port was provided on the command line, portName is already set; otherwise interactive input is available (the commented fgets can be re-enabled)
-    // fgets(portName, sizeof(portName), stdin);
-    // portName[strcspn(portName, "\r\n")] = 0;
-
     // Initialize ring buffer
     ring_buffer_init(&rxBuffer);
-
     // Open serial port
-    printf("Opening serial port %s...\n", portName);
-    serial.hCom = open_serial_port(portName, 115200);
+    // If no baud was provided on the command line, allow the user to enter it now
+    printf("Opening serial port %s at %d baud...\n", portName, baudRate);
+    serial.hCom = open_serial_port(portName, baudRate);
     serial.rxBuffer = &rxBuffer;
 
     if (serial.hCom == INVALID_HANDLE_VALUE) {
@@ -676,9 +687,6 @@ cleanup:
     CloseHandle(hThread);
     CloseHandle(serial.hCom);
     DeleteCriticalSection(&rxBuffer.lock);
-
-    printf("Press any key to exit...");
-    getchar();
 
     return 0;
 }
