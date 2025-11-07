@@ -51,13 +51,13 @@
 可通过命令行参数以非交互模式运行。位置参数说明：
 
 ```
-<程序名> <COM> <FTP_SERVER> <FTP_PORT> <USER> <PASS> <FILENAME>
+<程序名> <COM> <FTP_SERVER> <FTP_PORT> <USER> <PASS> <FILENAME> <BUADRATE>
 ```
 
 示例（PowerShell）：
 
 ```powershell
-.\"SIMCom FTP Tool.exe" COM3 117.131.85.140 60059 myuser mypass starline_gen7v2_900-00624.bin
+.\"SIMCom FTP Tool.exe" COM3 117.131.85.140 60059 myuser mypass starline_gen7v2_900-00624.bin 115200
 ```
 
 如果不提供 6 个命令行参数，程序会进入交互式模式，并按提示依次输入 COM、FTP 地址、端口、用户名、密码和文件名。

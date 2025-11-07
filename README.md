@@ -53,13 +53,13 @@ Use the Developer Command Prompt and build with `msbuild` or `cl`.
 The program supports non-interactive (positional argument) and interactive modes. Positional arguments (non-interactive):
 
 ```text
-<program> <COM> <FTP_SERVER> <FTP_PORT> <USER> <PASS> <FILENAME>
+<program> <COM> <FTP_SERVER> <FTP_PORT> <USER> <PASS> <FILENAME> <BUADRATE>
 ```
 
 Example (PowerShell):
 
 ```powershell
-.\\"SIMCom FTP Tool.exe" COM3 117.131.85.140 60059 myuser mypass starline_gen7v2_900-00624.bin
+.\\"SIMCom FTP Tool.exe" COM3 117.131.85.140 60059 myuser mypass starline_gen7v2_900-00624.bin 115200
 ```
 
 If fewer than 6 command-line arguments are provided, the program falls back to interactive prompts for COM port, FTP server, port, username, password and filename.
