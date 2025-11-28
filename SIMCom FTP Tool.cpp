@@ -288,6 +288,23 @@ HANDLE open_serial_port(const char* portName, int baudRate) {
     return hCom;
 }
 
+// Reconfigure an already-open serial port to a new baud rate.
+// Returns 1 on success, 0 on failure.
+int reconfigure_serial_port(HANDLE hCom, int baudRate) {
+    DCB dcb;
+    memset(&dcb, 0, sizeof(dcb));
+    dcb.DCBlength = sizeof(dcb);
+    if (!GetCommState(hCom, &dcb)) {
+        return 0;
+    }
+    dcb.BaudRate = baudRate;
+    // keep other settings as-is (ByteSize, Parity, StopBits, flow control)
+    if (!SetCommState(hCom, &dcb)) {
+        return 0;
+    }
+    return 1;
+}
+
 int send_at_command(HANDLE hCom, const char* command) {
     DWORD bytesWritten = 0;
     char fullCommand[256];
@@ -406,13 +423,22 @@ void enumerate_serial_ports() {
 }
 
 // Download file data
-int download_file_data(HANDLE hCom, RingBuffer* rb, const char* filename, int total_size) {
+int download_file_data(HANDLE hCom, RingBuffer* rb, const char* filename, int total_size,
+    int** offsets3, int* count3, int** offsets14, int* count14) {
     FILE* file;
     int offset = 0;
     int packet_size = 4096;
     char command[256];
     char line[256];
     int bytes_received = 0;
+
+    // initialize counters and dynamic arrays for offsets
+    if (count3) *count3 = 0;
+    if (count14) *count14 = 0;
+    if (offsets3) *offsets3 = NULL;
+    if (offsets14) *offsets14 = NULL;
+    int cap3 = 0;
+    int cap14 = 0;
 
     if (fopen_s(&file, filename, "wb") != 0) {
         printf("Unable to create file %s\n", filename);
@@ -462,7 +488,7 @@ int download_file_data(HANDLE hCom, RingBuffer* rb, const char* filename, int to
                                 Sleep(1);
                             }
                         }
-
+#if 0
                         // Print 16-byte-per-line hex view with offset relative to bytes already received
                         for (int i = 0; i < data_len; ++i) {
                             if ((i % 16) == 0) {
@@ -472,7 +498,7 @@ int download_file_data(HANDLE hCom, RingBuffer* rb, const char* filename, int to
                             printf("%02X ", (unsigned char)data[i]);
                         }
                         printf("\n");
-
+#endif
                         // Write to file
                         fwrite(data, 1, data_len, file);
                         fflush(file);
@@ -489,6 +515,23 @@ int download_file_data(HANDLE hCom, RingBuffer* rb, const char* filename, int to
             }
             else if (strstr(line, "+CFTPSGET: 14") != NULL) {
                 // Server returned code 14 for this offset — retry this offset
+                if (count14) {
+                    (*count14)++;
+                    // store offset
+                    if (offsets14) {
+                        if (*count14 > cap14) {
+                            int newCap = cap14 == 0 ? 8 : cap14 * 2;
+                            int* tmp = (int*)realloc(*offsets14, newCap * sizeof(int));
+                            if (tmp) {
+                                *offsets14 = tmp;
+                                cap14 = newCap;
+                            }
+                        }
+                        if (*offsets14 && *count14 <= cap14) {
+                            (*offsets14)[(*count14) - 1] = offset;
+                        }
+                    }
+                }
                 printf("Server returned +CFTPSGET: 14 for offset %d — will retry (attempt %d/%d)\n", offset, retries + 1, MAX_OFFSET_RETRIES);
                 retries++;
                 if (retries >= MAX_OFFSET_RETRIES) {
@@ -502,6 +545,23 @@ int download_file_data(HANDLE hCom, RingBuffer* rb, const char* filename, int to
             }
             else if (strstr(line, "+CFTPSGET: 3") != NULL) {
                 // Server returned code 3 for this offset — retry this offset
+                if (count3) {
+                    (*count3)++;
+                    // store offset
+                    if (offsets3) {
+                        if (*count3 > cap3) {
+                            int newCap = cap3 == 0 ? 8 : cap3 * 2;
+                            int* tmp = (int*)realloc(*offsets3, newCap * sizeof(int));
+                            if (tmp) {
+                                *offsets3 = tmp;
+                                cap3 = newCap;
+                            }
+                        }
+                        if (*offsets3 && *count3 <= cap3) {
+                            (*offsets3)[(*count3) - 1] = offset;
+                        }
+                    }
+                }
                 printf("Server returned +CFTPSGET: 3 for offset %d — will retry (attempt %d/%d)\n", offset, retries + 1, MAX_OFFSET_RETRIES);
                 retries++;
                 if (retries >= MAX_OFFSET_RETRIES) {
@@ -538,6 +598,11 @@ int main(int argc, char** argv) {
     char portName[64];
     char input[100];
     int file_size = 0;
+    ULONGLONG downloadStart = 0;
+    ULONGLONG downloadEnd = 0;
+    double elapsedSeconds = 0.0;
+    double kbps = 0.0;
+    int downloadResult = 0;
 
     // Command-line parameters (positional): <COM> <FTP_SERVER> <FTP_PORT> <USER> <PASS> <FILENAME>
     char ftp_server[128] = { 0 };
@@ -546,6 +611,12 @@ int main(int argc, char** argv) {
     char ftp_pass[128] = { 0 };
     char ftp_filename[260] = { 0 };
     int baudRate = 115200; // default baud rate
+    int defaultBaudRate = 115200;
+
+    int cftpsget_3_count = 0;
+    int cftpsget_14_count = 0;
+    int* cftpsget_3_offsets = NULL;
+    int* cftpsget_14_offsets = NULL;
 
     if (argc >= 7) {
         // argv[1] = COM (e.g., COM3)
@@ -596,8 +667,8 @@ int main(int argc, char** argv) {
     ring_buffer_init(&rxBuffer);
     // Open serial port
     // If no baud was provided on the command line, allow the user to enter it now
-    printf("Opening serial port %s at %d baud...\n", portName, baudRate);
-    serial.hCom = open_serial_port(portName, baudRate);
+    printf("Opening serial port %s at %d baud...\n", portName, defaultBaudRate);
+    serial.hCom = open_serial_port(portName, defaultBaudRate);
     serial.rxBuffer = &rxBuffer;
 
     if (serial.hCom == INVALID_HANDLE_VALUE) {
@@ -624,6 +695,60 @@ int main(int argc, char** argv) {
     if (!send_at_command(serial.hCom, "AT") || !wait_for_response(&rxBuffer, "OK", 1000)) {
         printf("AT command failed\n");
         goto cleanup;
+    }
+    // After receiving OK for AT, set device baud with AT+IPR=<baudRate>
+    {
+        char iprCmd[64];
+        sprintf_s(iprCmd, sizeof(iprCmd), "AT+IPR=%d", baudRate);
+        printf("Setting device baud rate: %s ...\n", iprCmd);
+
+        int maxAttempts = 3;
+        int attempt;
+        int iprOk = 0;
+
+        for (attempt = 1; attempt <= maxAttempts; ++attempt) {
+            if (send_at_command(serial.hCom, iprCmd) && wait_for_response(&rxBuffer, "OK", 2000)) {
+                iprOk = 1;
+                break;
+            }
+            printf("Attempt %d to set device baud failed, retrying...\n", attempt);
+            Sleep(200);
+        }
+
+        if (!iprOk) {
+            printf("Failed to set device baud rate with %s after %d attempts\n", iprCmd, maxAttempts);
+            goto cleanup;
+        }
+
+        // Stop receiver thread before changing local COM settings
+        printf("Stopping receiver thread to reconfigure local COM...\n");
+        serial.running = 0;
+        if (hThread) {
+            WaitForSingleObject(hThread, 2000);
+            CloseHandle(hThread);
+            hThread = NULL;
+        }
+
+        // Reconfigure local serial port to the new baud rate
+        printf("Reconfiguring local serial port to %d baud...\n", baudRate);
+        if (!reconfigure_serial_port(serial.hCom, baudRate)) {
+            printf("Failed to reconfigure serial port to %d\n", baudRate);
+            goto cleanup;
+        }
+
+        // Purge I/O buffers to avoid stale data
+        PurgeComm(serial.hCom, PURGE_RXCLEAR | PURGE_TXCLEAR);
+
+        // Allow device/time for the change to take effect
+        Sleep(100);
+
+        // Restart receiver thread
+        serial.running = 1;
+        hThread = CreateThread(NULL, 0, serial_receive_thread, &serial, 0, NULL);
+        if (hThread == NULL) {
+            printf("Unable to restart receiver thread after baud change\n");
+            goto cleanup;
+        }
     }
 
     // 2. Send AT+CFTPSSTART
@@ -673,10 +798,45 @@ int main(int argc, char** argv) {
 
     // 7. Download file
     printf("\n7. Start downloading file...\n");
-    if (!download_file_data(serial.hCom, &rxBuffer, ftp_filename, file_size)) {
+
+
+    // Measure download time
+    downloadStart = GetTickCount64();
+    downloadResult = download_file_data(serial.hCom, &rxBuffer, ftp_filename, file_size,
+        &cftpsget_3_offsets, &cftpsget_3_count, &cftpsget_14_offsets, &cftpsget_14_count);
+    downloadEnd = GetTickCount64();
+
+    elapsedSeconds = (double)(downloadEnd - downloadStart) / 1000.0;
+    if (elapsedSeconds <= 0.0) elapsedSeconds = 0.001; // avoid div by zero
+
+    // Compute kbps (kilobits per second) based on total file size
+    kbps = 0.0;
+    if (file_size > 0) {
+        double bits = (double)file_size * 8.0;
+        kbps = bits / 1000.0 / elapsedSeconds; // kilobits per second (kbit/s)
+    }
+
+    if (!downloadResult) {
         printf("File download failed\n");
+        // print counts and offsets even if failed
+        printf("+CFTPSGET: 3 occurrences: %d\n", cftpsget_3_count);
+        for (int i = 0; i < cftpsget_3_count; ++i) printf("  offset[%d]=%d\n", i, cftpsget_3_offsets[i]);
+        printf("+CFTPSGET: 14 occurrences: %d\n", cftpsget_14_count);
+        for (int i = 0; i < cftpsget_14_count; ++i) printf("  offset[%d]=%d\n", i, cftpsget_14_offsets[i]);
+        if (cftpsget_3_offsets) free(cftpsget_3_offsets);
+        if (cftpsget_14_offsets) free(cftpsget_14_offsets);
+        printf("Download time: %.3f s, average: %.2f kbps\n", elapsedSeconds, kbps);
         goto cleanup;
     }
+
+    // Print counters and offsets after successful download
+    printf("Download finished. +CFTPSGET: 3 occurrences: %d\n", cftpsget_3_count);
+    for (int i = 0; i < cftpsget_3_count; ++i) printf("  offset[%d]=%d\n", i, cftpsget_3_offsets[i]);
+    printf("Download finished. +CFTPSGET: 14 occurrences: %d\n", cftpsget_14_count);
+    for (int i = 0; i < cftpsget_14_count; ++i) printf("  offset[%d]=%d\n", i, cftpsget_14_offsets[i]);
+    if (cftpsget_3_offsets) free(cftpsget_3_offsets);
+    if (cftpsget_14_offsets) free(cftpsget_14_offsets);
+    printf("Download time: %.3f s, average: %.2f kbps\n", elapsedSeconds, kbps);
 
     printf("\n=== All operations completed ===\n");
 
