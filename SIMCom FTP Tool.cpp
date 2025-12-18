@@ -4,7 +4,7 @@
 #include <string.h>
 #include <ctype.h>
 
-#define RING_BUFFER_SIZE 8192
+#define RING_BUFFER_SIZE 65536
 #define MAX_PACKET_SIZE 8192
 #define MAX_RESPONSE_SIZE 8192
 // Maximum number of retries for the same offset when +CFTPSGET: 14 is returned
@@ -24,6 +24,9 @@ typedef struct {
     RingBuffer* rxBuffer;
     volatile int running;
 } SerialPort;
+
+// Progress callback: called from worker thread to report progress to UI.
+typedef void (*progress_cb_t)(void* ctx, int bytes_received, int total_size);
 
 // Ring buffer functions
 void ring_buffer_init(RingBuffer* rb) {
@@ -188,50 +191,99 @@ int ring_buffer_read_bulk(RingBuffer* rb, char* dest, int length) {
 // Serial receive thread (uses OVERLAPPED asynchronous reads to reduce blocking)
 DWORD WINAPI serial_receive_thread(LPVOID param) {
     SerialPort* serial = (SerialPort*)param;
-    DWORD bytesRead = 0;
-    char readBuffer[256];
-    OVERLAPPED ov = { 0 };
-    ov.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    const int BUF_SZ = 8192;
+    char* readBuf[2] = { NULL, NULL };
+    OVERLAPPED ov[2];
+    HANDLE events[2] = { NULL, NULL };
 
-    while (serial->running) {
-        ResetEvent(ov.hEvent);
-        BOOL ok = ReadFile(serial->hCom, readBuffer, sizeof(readBuffer), &bytesRead, &ov);
-        if (!ok) {
-            DWORD err = GetLastError();
-            if (err == ERROR_IO_PENDING) {
-                DWORD wait = WaitForSingleObject(ov.hEvent, 500);
-                if (wait == WAIT_OBJECT_0) {
-                    GetOverlappedResult(serial->hCom, &ov, &bytesRead, FALSE);
-                }
-                else {
-                    // timeout or other
-                    bytesRead = 0;
-                }
-            }
-            else {
-                // immediate error
-                Sleep(1);
-                bytesRead = 0;
-            }
-        }
+    for (int i = 0; i < 2; ++i) {
+        readBuf[i] = (char*)malloc(BUF_SZ);
+        ZeroMemory(&ov[i], sizeof(ov[i]));
+        events[i] = CreateEvent(NULL, TRUE, FALSE, NULL);
+        if (events[i]) ov[i].hEvent = events[i];
+    }
 
-        if (bytesRead > 0) {
+    // Issue initial reads for both buffers
+    for (int i = 0; i < 2; ++i) {
+        if (!readBuf[i] || !events[i]) continue;
+        ResetEvent(events[i]);
+        DWORD bytesRead = 0;
+        BOOL ok = ReadFile(serial->hCom, readBuf[i], (DWORD)BUF_SZ, &bytesRead, &ov[i]);
+        if (ok && bytesRead > 0) {
+            // Immediate data available — push to ring buffer now
             int remaining = (int)bytesRead;
-            char* ptr = readBuffer;
+            char* ptr = readBuf[i];
             while (remaining > 0) {
                 int w = ring_buffer_put_bulk(serial->rxBuffer, ptr, remaining);
-                if (w <= 0) {
-                    // buffer full, wait for consumer
-                    Sleep(1);
-                    continue;
-                }
-                ptr += w;
-                remaining -= w;
+                if (w <= 0) { Sleep(1); continue; }
+                ptr += w; remaining -= w;
+            }
+            // Reissue read
+            ResetEvent(events[i]);
+            ZeroMemory(&ov[i], sizeof(ov[i])); ov[i].hEvent = events[i];
+            ReadFile(serial->hCom, readBuf[i], (DWORD)BUF_SZ, &bytesRead, &ov[i]);
+        }
+        else {
+            DWORD err = GetLastError();
+            if (err != ERROR_IO_PENDING) {
+                // can't start read now; continue and try in loop
             }
         }
     }
 
-    CloseHandle(ov.hEvent);
+    while (serial->running) {
+        DWORD wait = WaitForMultipleObjects(2, events, FALSE, 500);
+        if (wait == WAIT_TIMEOUT) continue;
+
+        if (wait >= WAIT_OBJECT_0 && wait < WAIT_OBJECT_0 + 2) {
+            int idx = (int)(wait - WAIT_OBJECT_0);
+            DWORD bytesRead = 0;
+            BOOL res = GetOverlappedResult(serial->hCom, &ov[idx], &bytesRead, FALSE);
+            if (!res) {
+                DWORD ge = GetLastError();
+                if (ge == ERROR_OPERATION_ABORTED) {
+                    // read cancelled; likely shutdown
+                    break;
+                }
+                // other error — try reissuing later
+                ResetEvent(events[idx]);
+                ZeroMemory(&ov[idx], sizeof(ov[idx])); ov[idx].hEvent = events[idx];
+                ReadFile(serial->hCom, readBuf[idx], (DWORD)BUF_SZ, &bytesRead, &ov[idx]);
+                continue;
+            }
+
+            if (bytesRead > 0) {
+                int remaining = (int)bytesRead;
+                char* ptr = readBuf[idx];
+                while (remaining > 0) {
+                    int w = ring_buffer_put_bulk(serial->rxBuffer, ptr, remaining);
+                    if (w <= 0) { Sleep(1); continue; }
+                    ptr += w; remaining -= w;
+                }
+            }
+
+            // Reissue read on this buffer
+            ResetEvent(events[idx]);
+            ZeroMemory(&ov[idx], sizeof(ov[idx])); ov[idx].hEvent = events[idx];
+            DWORD br = 0;
+            BOOL ok = ReadFile(serial->hCom, readBuf[idx], (DWORD)BUF_SZ, &br, &ov[idx]);
+            if (!ok) {
+                DWORD err = GetLastError();
+                if (err != ERROR_IO_PENDING) {
+                    // Failed to reissue read — short sleep and retry
+                    Sleep(1);
+                }
+            }
+        }
+    }
+
+    // Cleanup: cancel any pending IO and free buffers/events
+    CancelIo(serial->hCom);
+    for (int i = 0; i < 2; ++i) {
+        if (events[i]) { WaitForSingleObject(events[i], 10); CloseHandle(events[i]); }
+        if (readBuf[i]) free(readBuf[i]);
+    }
+
     return 0;
 }
 
@@ -428,8 +480,8 @@ int download_file_data(HANDLE hCom, RingBuffer* rb, const char* filename, int to
     FILE* file;
     int offset = 0;
     int packet_size = 4096;
-    char command[256];
-    char line[256];
+    char command[256] = { 0 };
+    char line[256]= { 0 };
     int bytes_received = 0;
 
     // initialize counters and dynamic arrays for offsets
@@ -466,7 +518,7 @@ int download_file_data(HANDLE hCom, RingBuffer* rb, const char* filename, int to
                 continue;
             }
 
-            printf("Received: %s", line);
+            printf("FTP Received :%s", line);
 
             if (strstr(line, "+CFTPSGET: DATA,") != NULL) {
                 // Parse data length
@@ -596,7 +648,6 @@ int main(int argc, char** argv) {
     RingBuffer rxBuffer;
     HANDLE hThread;
     char portName[64];
-    char input[100];
     int file_size = 0;
     ULONGLONG downloadStart = 0;
     ULONGLONG downloadEnd = 0;
@@ -723,6 +774,8 @@ int main(int argc, char** argv) {
         // Stop receiver thread before changing local COM settings
         printf("Stopping receiver thread to reconfigure local COM...\n");
         serial.running = 0;
+        // Cancel any pending overlapped I/O so the thread unblocks promptly
+        CancelIo(serial.hCom);
         if (hThread) {
             WaitForSingleObject(hThread, 2000);
             CloseHandle(hThread);
@@ -843,6 +896,8 @@ int main(int argc, char** argv) {
 cleanup:
     // Cleanup resources
     serial.running = 0;
+    // Ensure any pending I/O is cancelled so receive thread can exit quickly
+    CancelIo(serial.hCom);
     WaitForSingleObject(hThread, 1000);
     CloseHandle(hThread);
     CloseHandle(serial.hCom);
